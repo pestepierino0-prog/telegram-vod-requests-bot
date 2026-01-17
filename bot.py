@@ -1,6 +1,8 @@
 import os
 import re
 import time
+from datetime import datetime, timedelta, timezone
+
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from openai import OpenAI
@@ -10,7 +12,8 @@ from openai import OpenAI
 # ======================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-ADMIN_CHAT_ID_RAW = os.getenv("ADMIN_CHAT_ID", "").strip()  # e.g. -1001234567890
+ADMIN_CHAT_ID_RAW = os.getenv("ADMIN_CHAT_ID", "").strip()          # staff channel/group id: -100...
+MEMBER_GROUP_ID_RAW = os.getenv("MEMBER_GROUP_ID", "").strip()      # main group id allowed: -100...
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
@@ -18,11 +21,18 @@ if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY")
 if not ADMIN_CHAT_ID_RAW:
     raise RuntimeError("Missing ADMIN_CHAT_ID (e.g. -100...)")
+if not MEMBER_GROUP_ID_RAW:
+    raise RuntimeError("Missing MEMBER_GROUP_ID (e.g. -100...)")
 
 try:
     ADMIN_CHAT_ID = int(ADMIN_CHAT_ID_RAW)
 except ValueError as e:
-    raise RuntimeError("ADMIN_CHAT_ID must be an integer (e.g. -100123...)") from e
+    raise RuntimeError("ADMIN_CHAT_ID must be an integer like -100...") from e
+
+try:
+    MEMBER_GROUP_ID = int(MEMBER_GROUP_ID_RAW)
+except ValueError as e:
+    raise RuntimeError("MEMBER_GROUP_ID must be an integer like -100...") from e
 
 # ======================
 # INIT
@@ -31,22 +41,44 @@ bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ======================
+# CONFIG (limits)
+# ======================
+MAX_REQUESTS_24H = 3
+SPAM_STREAK_LIMIT = 3
+SPAM_WINDOW_MINUTES = 10
+BLOCK_HOURS = 24
+
+# ======================
 # STATE (in-memory)
 # ======================
 # user_id -> {"step": int, "data": dict}
 states = {}
 
-# admin_message_id -> {"user_chat_id": int, "user_display": str}
-# (serve per notificare l'utente quando lo staff clicca)
-admin_ticket_map = {}
+# admin_message_id -> ticket info
+tickets = {}  # {admin_msg_id: {...}}
+
+# per-user throttling / anti-spam
+user_limits = {}  # user_id -> {"req_times": [ts], "streak": int, "last_req_ts": ts|None, "blocked_until": ts|None}
+
+# C1: daily count
+daily_counts = {}  # "YYYY-MM-DD" -> int
+
+# C3: history per user (keep last 20)
+user_history = {}  # user_id -> [ticket_summary_dict]
 
 # ======================
 # HELPERS
 # ======================
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def ts() -> float:
+    return time.time()
+
 def clean_text(s: str) -> str:
     s = (s or "").strip()
     s = re.sub(r"\s+", " ", s)
-    return s[:600]
+    return s[:700]
 
 def has_sensitive_request(text: str) -> bool:
     t = (text or "").lower()
@@ -56,6 +88,71 @@ def user_display_from_tg(user) -> str:
     name = f"{user.first_name or ''} {user.last_name or ''}".strip()
     username = f"@{user.username}" if user.username else ""
     return (name + (" " + username if username else "")).strip() or "Utente"
+
+def is_allowed_user(user_id: int) -> bool:
+    """
+    E1: allow only members of MEMBER_GROUP_ID.
+    Bot must be able to call getChatMember on that group.
+    """
+    try:
+        cm = bot.get_chat_member(MEMBER_GROUP_ID, user_id)
+        # statuses: creator, administrator, member, restricted, left, kicked
+        return cm.status in ("creator", "administrator", "member")
+    except Exception:
+        # If Telegram denies access or bot not in group -> treat as not allowed
+        return False
+
+def get_user_limit_state(user_id: int):
+    if user_id not in user_limits:
+        user_limits[user_id] = {"req_times": [], "streak": 0, "last_req_ts": None, "blocked_until": None}
+    return user_limits[user_id]
+
+def prune_24h(times_list):
+    cutoff = ts() - 24 * 3600
+    return [t for t in times_list if t >= cutoff]
+
+def can_submit_request(user_id: int):
+    st = get_user_limit_state(user_id)
+    bu = st.get("blocked_until")
+    if bu and ts() < bu:
+        remaining = int((bu - ts()) // 60)
+        return False, f"⛔ Sei temporaneamente bloccato per spam. Riprova tra circa {remaining} minuti."
+
+    st["req_times"] = prune_24h(st["req_times"])
+    if len(st["req_times"]) >= MAX_REQUESTS_24H:
+        return False, f"⛔ Hai raggiunto il limite: massimo {MAX_REQUESTS_24H} richieste ogni 24 ore."
+
+    return True, None
+
+def register_request_submission(user_id: int):
+    st = get_user_limit_state(user_id)
+
+    # 24h counter
+    st["req_times"] = prune_24h(st["req_times"])
+    st["req_times"].append(ts())
+
+    # streak logic (A2): if requests are close, increase streak; else reset
+    last = st.get("last_req_ts")
+    if last and (ts() - last) <= SPAM_WINDOW_MINUTES * 60:
+        st["streak"] = st.get("streak", 0) + 1
+    else:
+        st["streak"] = 1
+
+    st["last_req_ts"] = ts()
+
+    # if streak hits limit => block for 24h
+    if st["streak"] >= SPAM_STREAK_LIMIT:
+        st["blocked_until"] = ts() + BLOCK_HOURS * 3600
+
+def inc_daily_counter():
+    key = now_utc().strftime("%Y-%m-%d")
+    daily_counts[key] = daily_counts.get(key, 0) + 1
+
+def add_history(user_id: int, ticket_summary: dict):
+    arr = user_history.get(user_id, [])
+    arr.append(ticket_summary)
+    # keep last 20
+    user_history[user_id] = arr[-20:]
 
 def init_state(user_id: int):
     states[user_id] = {
@@ -178,13 +275,33 @@ def kb_confirm() -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton("❌ Annulla", callback_data="cancel"))
     return kb
 
-def kb_staff_status() -> InlineKeyboardMarkup:
+def kb_staff_initial() -> InlineKeyboardMarkup:
+    """
+    Staff keyboard shown when ticket is created.
+    Includes Assign + status options.
+    """
     kb = InlineKeyboardMarkup()
+    kb.row(InlineKeyboardButton("👤 Assegnata a me", callback_data="staff:assign"))
     kb.row(
         InlineKeyboardButton("🟡 Presa in carico", callback_data="staff:in_progress"),
         InlineKeyboardButton("🟢 Completata", callback_data="staff:done"),
+    )
+    kb.row(
+        InlineKeyboardButton("🔴 Non Disponibile", callback_data="staff:na"),
+        InlineKeyboardButton("🟠 Già presente (controlla bene)", callback_data="staff:already"),
+    )
+    return kb
+
+def kb_staff_after_assign_or_progress() -> InlineKeyboardMarkup:
+    """
+    After assign / in_progress: keep only final status actions.
+    """
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton("🟢 Completata", callback_data="staff:done"),
         InlineKeyboardButton("🔴 Non Disponibile", callback_data="staff:na"),
     )
+    kb.row(InlineKeyboardButton("🟠 Già presente (controlla bene)", callback_data="staff:already"))
     return kb
 
 # ======================
@@ -194,22 +311,33 @@ def kb_staff_status() -> InlineKeyboardMarkup:
 def start(m):
     bot.send_message(m.chat.id, INTRO)
 
+@bot.message_handler(commands=["request"])
+def request(m):
+    # E1: Only group members
+    if not is_allowed_user(m.from_user.id):
+        bot.send_message(m.chat.id, "⛔ Questo bot è riservato agli utenti del gruppo. Se pensi sia un errore, contatta un admin.")
+        return
+
+    # A1 / A2 pre-check
+    ok, reason = can_submit_request(m.from_user.id)
+    if not ok:
+        bot.send_message(m.chat.id, reason)
+        return
+
+    init_state(m.from_user.id)
+    bot.send_message(m.chat.id, "Ok! Dimmi il *titolo* (film o serie).", reply_markup=kb_cancel())
+
 @bot.message_handler(commands=["cancel"])
 def cancel_cmd(m):
     states.pop(m.from_user.id, None)
     bot.send_message(m.chat.id, "Richiesta annullata. Se vuoi riprovare: /request")
-
-@bot.message_handler(commands=["request"])
-def request(m):
-    init_state(m.from_user.id)
-    bot.send_message(m.chat.id, "Ok! Dimmi il *titolo* (film o serie).", reply_markup=kb_cancel())
 
 # ======================
 # CALLBACK ROUTER
 # ======================
 @bot.callback_query_handler(func=lambda c: True)
 def callback_router(call):
-    # always ack callback (removes spinner)
+    # ack callback spinner
     try:
         bot.answer_callback_query(call.id)
     except Exception:
@@ -218,12 +346,11 @@ def callback_router(call):
     user_id = call.from_user.id
     chat_id = call.message.chat.id
     msg_id = call.message.message_id
-    data_cb = call.data or ""
+    cb = call.data or ""
 
-    # --- CANCEL (works everywhere) ---
-    if data_cb == "cancel":
+    # CANCEL anywhere
+    if cb == "cancel":
         states.pop(user_id, None)
-        # remove buttons if possible
         try:
             bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
         except Exception:
@@ -231,56 +358,123 @@ def callback_router(call):
         bot.send_message(chat_id, "Richiesta annullata. Se vuoi riprovare: /request")
         return
 
-    # --- STAFF BUTTONS (only in admin chat) ---
-    if data_cb.startswith("staff:"):
+    # ======================
+    # STAFF actions (only in ADMIN_CHAT_ID)
+    # ======================
+    if cb.startswith("staff:"):
         if chat_id != ADMIN_CHAT_ID:
             return
 
-        action = data_cb.split(":", 1)[1]
-        status_text = {
-            "in_progress": "🟡 Presa in carico",
+        action = cb.split(":", 1)[1]
+        staff_name = user_display_from_tg(call.from_user)
+        t = tickets.get(msg_id, {})
+
+        # default status lines
+        def append_line(text: str) -> str:
+            return (call.message.text or "") + f"\n\n{text}"
+
+        # ASSIGN (non-terminal, keep buttons but remove assign)
+        if action == "assign":
+            t["assignee"] = staff_name
+            tickets[msg_id] = t
+
+            try:
+                bot.edit_message_text(
+                    append_line(f"👤 Assegnata a: {staff_name}"),
+                    ADMIN_CHAT_ID,
+                    msg_id,
+                    reply_markup=kb_staff_after_assign_or_progress(),
+                )
+            except Exception:
+                try:
+                    bot.edit_message_reply_markup(ADMIN_CHAT_ID, msg_id, reply_markup=kb_staff_after_assign_or_progress())
+                except Exception:
+                    pass
+            return
+
+        # IN PROGRESS (non-terminal)
+        if action == "in_progress":
+            t["status"] = "🟡 Presa in carico"
+            t["assignee"] = t.get("assignee") or staff_name
+            tickets[msg_id] = t
+
+            # notify user if we can
+            if t.get("user_chat_id"):
+                try:
+                    bot.send_message(int(t["user_chat_id"]), "🟡 La tua richiesta è stata presa in carico dallo staff.")
+                except Exception:
+                    pass
+
+            try:
+                bot.edit_message_text(
+                    append_line(f"📌 Stato: 🟡 Presa in carico (da {t.get('assignee')})"),
+                    ADMIN_CHAT_ID,
+                    msg_id,
+                    reply_markup=kb_staff_after_assign_or_progress(),
+                )
+            except Exception:
+                try:
+                    bot.edit_message_reply_markup(ADMIN_CHAT_ID, msg_id, reply_markup=kb_staff_after_assign_or_progress())
+                except Exception:
+                    pass
+            return
+
+        # Terminal actions: DONE / NA / ALREADY -> remove buttons (disable after first click)
+        status_map = {
             "done": "🟢 Completata",
             "na": "🔴 Non Disponibile",
-        }.get(action, "📌 Aggiornato")
+            "already": "🟠 Già presente (controlla bene)",
+        }
+        if action in status_map:
+            status_text = status_map[action]
+            t["status"] = status_text
+            t["closed_by"] = staff_name
+            tickets[msg_id] = t
 
-        staff_name = user_display_from_tg(call.from_user)
+            # Notify user
+            user_chat_id = t.get("user_chat_id")
+            if user_chat_id:
+                try:
+                    if action == "done":
+                        bot.send_message(int(user_chat_id), "🟢 La tua richiesta è stata completata. Grazie!")
+                    elif action == "na":
+                        bot.send_message(int(user_chat_id), "🔴 La tua richiesta al momento non è disponibile.")
+                    elif action == "already":
+                        bot.send_message(int(user_chat_id), "🟠 Questa richiesta risulta già presente. Controlla bene e, se serve, specifica meglio titolo/anno.")
+                except Exception:
+                    pass
 
-        # Update admin message and REMOVE BUTTONS (disable after first click)
-        try:
-            bot.edit_message_text(
-                call.message.text + f"\n\n📌 Stato: {status_text} (da {staff_name})",
-                chat_id,
-                msg_id,
-                reply_markup=None,  # <- disattiva pulsanti dopo 1 click
-            )
-        except Exception:
-            # fallback: at least remove keyboard
+            # Update admin message and DISABLE buttons (reply_markup=None)
+            assignee = t.get("assignee") or staff_name
             try:
-                bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
+                bot.edit_message_text(
+                    append_line(f"📌 Stato: {status_text} (da {staff_name})\n👤 Assegnata a: {assignee}"),
+                    ADMIN_CHAT_ID,
+                    msg_id,
+                    reply_markup=None,  # <-- disattiva dopo il primo click terminale
+                )
             except Exception:
-                pass
+                try:
+                    bot.edit_message_reply_markup(ADMIN_CHAT_ID, msg_id, reply_markup=None)
+                except Exception:
+                    pass
 
-        # Notify user if we still have mapping
-        info = admin_ticket_map.get(msg_id)
-        if info:
-            user_chat = info["user_chat_id"]
-            try:
-                if action == "in_progress":
-                    bot.send_message(user_chat, "🟡 La tua richiesta è stata presa in carico dallo staff.")
-                elif action == "done":
-                    bot.send_message(user_chat, "🟢 La tua richiesta è stata completata. Grazie!")
-                elif action == "na":
-                    bot.send_message(user_chat, "🔴 La tua richiesta al momento non è disponibile.")
-                else:
-                    bot.send_message(user_chat, f"📌 Aggiornamento richiesta: {status_text}")
-            except Exception:
-                pass
+            # Update history status if possible
+            uid = t.get("user_id")
+            if uid in user_history:
+                # find by admin_msg_id and update last match
+                for item in reversed(user_history[uid]):
+                    if item.get("admin_msg_id") == msg_id:
+                        item["status"] = status_text
+                        item["updated_at"] = now_utc().isoformat()
+                        break
+            return
 
-            if action in ("done", "na"):
-                admin_ticket_map.pop(msg_id, None)
-        return
+        return  # unknown staff action
 
-    # --- USER FLOW BUTTONS ---
+    # ======================
+    # USER flow buttons
+    # ======================
     if user_id not in states:
         bot.send_message(chat_id, "Per iniziare una richiesta: /request")
         return
@@ -290,10 +484,10 @@ def callback_router(call):
     req = st["data"]
 
     # TYPE
-    if data_cb.startswith("type:"):
+    if cb.startswith("type:"):
         if step != 2:
             return
-        chosen = data_cb.split(":", 1)[1]
+        chosen = cb.split(":", 1)[1]
         req["type"] = "Film" if chosen == "film" else "Serie"
         try:
             bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
@@ -304,10 +498,10 @@ def callback_router(call):
         return
 
     # YEAR
-    if data_cb.startswith("year:"):
+    if cb.startswith("year:"):
         if step != 3:
             return
-        chosen = data_cb.split(":", 1)[1]
+        chosen = cb.split(":", 1)[1]
         try:
             bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
         except Exception:
@@ -330,10 +524,10 @@ def callback_router(call):
         return
 
     # SERIES MODE
-    if data_cb.startswith("series:"):
+    if cb.startswith("series:"):
         if step != 4:
             return
-        chosen = data_cb.split(":", 1)[1]
+        chosen = cb.split(":", 1)[1]
         try:
             bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
         except Exception:
@@ -349,10 +543,10 @@ def callback_router(call):
         return
 
     # LANGUAGE
-    if data_cb.startswith("lang:"):
+    if cb.startswith("lang:"):
         if step != 5:
             return
-        chosen = data_cb.split(":", 1)[1]
+        chosen = cb.split(":", 1)[1]
         try:
             bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
         except Exception:
@@ -369,10 +563,10 @@ def callback_router(call):
         return
 
     # CONFIRM
-    if data_cb.startswith("confirm:"):
+    if cb.startswith("confirm:"):
         if step != 7:
             return
-        action = data_cb.split(":", 1)[1]
+        action = cb.split(":", 1)[1]
         try:
             bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=None)
         except Exception:
@@ -383,11 +577,19 @@ def callback_router(call):
             bot.send_message(chat_id, "Ok! Riscrivi le note (se nulla “-”).", reply_markup=kb_cancel())
             return
 
-        # SEND to staff
+        # Before sending: enforce limits again (A1/A2)
+        ok, reason = can_submit_request(user_id)
+        if not ok:
+            bot.send_message(chat_id, reason)
+            states.pop(user_id, None)
+            return
+
+        # Build payload for staff
+        u = call.from_user
         user_info = {
-            "user_id": call.from_user.id,
-            "username": f"@{call.from_user.username}" if call.from_user.username else "(no username)",
-            "name": f"{call.from_user.first_name or ''} {call.from_user.last_name or ''}".strip(),
+            "user_id": u.id,
+            "username": f"@{u.username}" if u.username else "(no username)",
+            "name": f"{u.first_name or ''} {u.last_name or ''}".strip(),
         }
 
         payload = (
@@ -400,6 +602,7 @@ def callback_router(call):
             f"Note: {req['notes']}\n"
         )
 
+        # ChatGPT formatting
         try:
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -412,16 +615,41 @@ def callback_router(call):
         except Exception:
             formatted = "📌 NUOVA RICHIESTA VOD\n" + payload
 
-        # Send to admin with staff buttons
-        msg_admin = bot.send_message(ADMIN_CHAT_ID, formatted, reply_markup=kb_staff_status())
+        # Send to staff with buttons
+        msg_admin = bot.send_message(ADMIN_CHAT_ID, formatted, reply_markup=kb_staff_initial())
 
-        # Save mapping so staff click can notify user
-        admin_ticket_map[msg_admin.message_id] = {
-            "user_chat_id": chat_id,  # user private chat with bot
-            "user_display": user_display_from_tg(call.from_user),
+        # Register ticket info
+        ticket = {
+            "admin_msg_id": msg_admin.message_id,
+            "user_id": user_id,
+            "user_chat_id": chat_id,
+            "user_display": user_display_from_tg(u),
+            "created_at": now_utc().isoformat(),
+            "status": "Nuova",
+            "assignee": None,
+            "title": req["title"],
+            "type": req["type"],
+            "year": req["year"],
         }
+        tickets[msg_admin.message_id] = ticket
 
-        bot.send_message(chat_id, "✅ Inviato allo staff. Grazie!")
+        # C3 history per user
+        add_history(user_id, {
+            "admin_msg_id": msg_admin.message_id,
+            "created_at": ticket["created_at"],
+            "title": ticket["title"],
+            "type": ticket["type"],
+            "year": ticket["year"],
+            "status": "Nuova",
+        })
+
+        # A1/A2 counters
+        register_request_submission(user_id)
+        inc_daily_counter()
+
+        # Confirmation to user (also show daily count)
+        today_key = now_utc().strftime("%Y-%m-%d")
+        bot.send_message(chat_id, f"✅ Inviato allo staff. (Richieste oggi: {daily_counts.get(today_key,0)}) Grazie!")
         states.pop(user_id, None)
         return
 
@@ -434,9 +662,16 @@ def handle_text(m):
     chat_id = m.chat.id
     text = (m.text or "").strip()
 
+    # If not in flow
     if user_id not in states:
         if has_sensitive_request(text):
             bot.send_message(chat_id, "Posso solo registrare la richiesta (titolo/dettagli) e inoltrarla allo staff. Usa /request per iniziare.")
+        return
+
+    # E1: only allowed users (also during flow)
+    if not is_allowed_user(user_id):
+        states.pop(user_id, None)
+        bot.send_message(chat_id, "⛔ Questo bot è riservato agli utenti del gruppo.")
         return
 
     st = states[user_id]
@@ -485,9 +720,8 @@ def handle_text(m):
     # 6) NOTES -> CONFIRM
     if step == 6:
         req["notes"] = text
-        summary = format_summary(req)
         st["step"] = 7
-        bot.send_message(chat_id, summary + "\nConfermi l’invio allo staff?", reply_markup=kb_confirm())
+        bot.send_message(chat_id, format_summary(req) + "\nConfermi l’invio allo staff?", reply_markup=kb_confirm())
         return
 
     bot.send_message(chat_id, "Se vuoi iniziare una nuova richiesta: /request (oppure /cancel per annullare).")
