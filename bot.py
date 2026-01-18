@@ -1,7 +1,8 @@
 import os
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+import pytz
 
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -44,27 +45,31 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # CONFIG (limits)
 # ======================
 MAX_REQUESTS_24H = 3
+
 SPAM_STREAK_LIMIT = 3
 SPAM_WINDOW_MINUTES = 10
 BLOCK_HOURS = 24
 
 # ======================
+# ORARI RICHIESTE
+# ======================
+REQUEST_START_HOUR = 10  # 10:00
+REQUEST_END_HOUR = 21    # 21:00 (stop alle 21:00)
+TIMEZONE_NAME = "Europe/Rome"
+
+CLOSED_MESSAGE = (
+    "⏰ Le richieste sono attive dalle **10:00 alle 21:00**.\n"
+    "Riprova più tardi 🙏"
+)
+
+# ======================
 # STATE (in-memory)
 # ======================
-# user_id -> {"step": int, "data": dict}
-states = {}
-
-# admin_message_id -> ticket info
-tickets = {}  # {admin_msg_id: {...}}
-
-# per-user throttling / anti-spam
-user_limits = {}  # user_id -> {"req_times": [ts], "streak": int, "last_req_ts": ts|None, "blocked_until": ts|None}
-
-# C1: daily count
+states = {}        # user_id -> {"step": int, "data": dict}
+tickets = {}       # admin_message_id -> ticket info dict
+user_limits = {}   # user_id -> {"req_times":[ts], "streak":int, "last_req_ts":ts|None, "blocked_until":ts|None}
 daily_counts = {}  # "YYYY-MM-DD" -> int
-
-# C3: history per user (keep last 20)
-user_history = {}  # user_id -> [ticket_summary_dict]
+user_history = {}  # user_id -> [ticket_summary_dict] (last 20)
 
 # ======================
 # HELPERS
@@ -91,16 +96,21 @@ def user_display_from_tg(user) -> str:
 
 def is_allowed_user(user_id: int) -> bool:
     """
-    E1: allow only members of MEMBER_GROUP_ID.
-    Bot must be able to call getChatMember on that group.
+    E1: only users who are members of MEMBER_GROUP_ID can use the bot.
+    Bot must be inside that group and preferably admin to reliably call get_chat_member.
     """
     try:
         cm = bot.get_chat_member(MEMBER_GROUP_ID, user_id)
-        # statuses: creator, administrator, member, restricted, left, kicked
         return cm.status in ("creator", "administrator", "member")
     except Exception:
-        # If Telegram denies access or bot not in group -> treat as not allowed
         return False
+
+def is_request_time_allowed() -> bool:
+    tz = pytz.timezone(TIMEZONE_NAME)
+    now_local = datetime.now(tz)
+    start = now_local.replace(hour=REQUEST_START_HOUR, minute=0, second=0, microsecond=0)
+    end = now_local.replace(hour=REQUEST_END_HOUR, minute=0, second=0, microsecond=0)
+    return start <= now_local < end
 
 def get_user_limit_state(user_id: int):
     if user_id not in user_limits:
@@ -113,10 +123,11 @@ def prune_24h(times_list):
 
 def can_submit_request(user_id: int):
     st = get_user_limit_state(user_id)
+
     bu = st.get("blocked_until")
     if bu and ts() < bu:
-        remaining = int((bu - ts()) // 60)
-        return False, f"⛔ Sei temporaneamente bloccato per spam. Riprova tra circa {remaining} minuti."
+        remaining_min = int((bu - ts()) // 60)
+        return False, f"⛔ Sei temporaneamente bloccato per spam. Riprova tra circa {remaining_min} minuti."
 
     st["req_times"] = prune_24h(st["req_times"])
     if len(st["req_times"]) >= MAX_REQUESTS_24H:
@@ -127,11 +138,9 @@ def can_submit_request(user_id: int):
 def register_request_submission(user_id: int):
     st = get_user_limit_state(user_id)
 
-    # 24h counter
     st["req_times"] = prune_24h(st["req_times"])
     st["req_times"].append(ts())
 
-    # streak logic (A2): if requests are close, increase streak; else reset
     last = st.get("last_req_ts")
     if last and (ts() - last) <= SPAM_WINDOW_MINUTES * 60:
         st["streak"] = st.get("streak", 0) + 1
@@ -140,7 +149,6 @@ def register_request_submission(user_id: int):
 
     st["last_req_ts"] = ts()
 
-    # if streak hits limit => block for 24h
     if st["streak"] >= SPAM_STREAK_LIMIT:
         st["blocked_until"] = ts() + BLOCK_HOURS * 3600
 
@@ -151,7 +159,6 @@ def inc_daily_counter():
 def add_history(user_id: int, ticket_summary: dict):
     arr = user_history.get(user_id, [])
     arr.append(ticket_summary)
-    # keep last 20
     user_history[user_id] = arr[-20:]
 
 def init_state(user_id: int):
@@ -190,20 +197,20 @@ def format_summary(data: dict) -> str:
     )
 
 SYSTEM_PROMPT = """
-Sei un assistente helpdesk per richieste VOD.
+Sei un assistente helpdesk per richieste contenuti.
 Il tuo compito è SOLO raccogliere e formattare richieste per lo staff.
 
 Regole:
-- Non fornire link, accessi, attivazioni o istruzioni per ottenere contenuti.
+- Non fornire link, accessi o credenziali.
 - Non fare promozioni o prezzi.
-- Se l’utente chiede link/accesso/attivazione, rispondi educatamente che puoi solo registrare la richiesta (titolo/dettagli) e inoltrarla allo staff.
+- Se l’utente chiede link/accesso, rispondi che puoi solo registrare la richiesta e inoltrarla allo staff.
 - Tono: educato, neutro, chiaro.
 
 Output: crea una scheda richiesta in italiano, ordinata e breve.
 """
 
 INTRO = (
-    "Ciao! 👋 Posso registrare una richiesta VOD e inoltrarla allo staff.\n"
+    "Ciao! 👋 Posso registrare una richiesta e inoltrarla allo staff.\n"
     "Scrivi /request per iniziare.\n"
     "Nota: non posso fornire link o accessi, solo raccogliere la richiesta."
 )
@@ -276,10 +283,6 @@ def kb_confirm() -> InlineKeyboardMarkup:
     return kb
 
 def kb_staff_initial() -> InlineKeyboardMarkup:
-    """
-    Staff keyboard shown when ticket is created.
-    Includes Assign + status options.
-    """
     kb = InlineKeyboardMarkup()
     kb.row(InlineKeyboardButton("👤 Assegnata a me", callback_data="staff:assign"))
     kb.row(
@@ -293,9 +296,6 @@ def kb_staff_initial() -> InlineKeyboardMarkup:
     return kb
 
 def kb_staff_after_assign_or_progress() -> InlineKeyboardMarkup:
-    """
-    After assign / in_progress: keep only final status actions.
-    """
     kb = InlineKeyboardMarkup()
     kb.row(
         InlineKeyboardButton("🟢 Completata", callback_data="staff:done"),
@@ -313,12 +313,17 @@ def start(m):
 
 @bot.message_handler(commands=["request"])
 def request(m):
-    # E1: Only group members
+    # Orari
+    if not is_request_time_allowed():
+        bot.send_message(m.chat.id, CLOSED_MESSAGE)
+        return
+
+    # E1
     if not is_allowed_user(m.from_user.id):
         bot.send_message(m.chat.id, "⛔ Questo bot è riservato agli utenti del gruppo. Se pensi sia un errore, contatta un admin.")
         return
 
-    # A1 / A2 pre-check
+    # A1/A2
     ok, reason = can_submit_request(m.from_user.id)
     if not ok:
         bot.send_message(m.chat.id, reason)
@@ -337,7 +342,6 @@ def cancel_cmd(m):
 # ======================
 @bot.callback_query_handler(func=lambda c: True)
 def callback_router(call):
-    # ack callback spinner
     try:
         bot.answer_callback_query(call.id)
     except Exception:
@@ -369,15 +373,13 @@ def callback_router(call):
         staff_name = user_display_from_tg(call.from_user)
         t = tickets.get(msg_id, {})
 
-        # default status lines
         def append_line(text: str) -> str:
             return (call.message.text or "") + f"\n\n{text}"
 
-        # ASSIGN (non-terminal, keep buttons but remove assign)
+        # ASSIGN (non-terminal)
         if action == "assign":
             t["assignee"] = staff_name
             tickets[msg_id] = t
-
             try:
                 bot.edit_message_text(
                     append_line(f"👤 Assegnata a: {staff_name}"),
@@ -398,7 +400,6 @@ def callback_router(call):
             t["assignee"] = t.get("assignee") or staff_name
             tickets[msg_id] = t
 
-            # notify user if we can
             if t.get("user_chat_id"):
                 try:
                     bot.send_message(int(t["user_chat_id"]), "🟡 La tua richiesta è stata presa in carico dallo staff.")
@@ -419,7 +420,7 @@ def callback_router(call):
                     pass
             return
 
-        # Terminal actions: DONE / NA / ALREADY -> remove buttons (disable after first click)
+        # Terminal actions: DONE / NA / ALREADY -> disable buttons
         status_map = {
             "done": "🟢 Completata",
             "na": "🔴 Non Disponibile",
@@ -431,7 +432,6 @@ def callback_router(call):
             t["closed_by"] = staff_name
             tickets[msg_id] = t
 
-            # Notify user
             user_chat_id = t.get("user_chat_id")
             if user_chat_id:
                 try:
@@ -444,14 +444,13 @@ def callback_router(call):
                 except Exception:
                     pass
 
-            # Update admin message and DISABLE buttons (reply_markup=None)
             assignee = t.get("assignee") or staff_name
             try:
                 bot.edit_message_text(
                     append_line(f"📌 Stato: {status_text} (da {staff_name})\n👤 Assegnata a: {assignee}"),
                     ADMIN_CHAT_ID,
                     msg_id,
-                    reply_markup=None,  # <-- disattiva dopo il primo click terminale
+                    reply_markup=None,  # disable after first final click
                 )
             except Exception:
                 try:
@@ -459,10 +458,8 @@ def callback_router(call):
                 except Exception:
                     pass
 
-            # Update history status if possible
             uid = t.get("user_id")
             if uid in user_history:
-                # find by admin_msg_id and update last match
                 for item in reversed(user_history[uid]):
                     if item.get("admin_msg_id") == msg_id:
                         item["status"] = status_text
@@ -470,7 +467,7 @@ def callback_router(call):
                         break
             return
 
-        return  # unknown staff action
+        return
 
     # ======================
     # USER flow buttons
@@ -577,14 +574,18 @@ def callback_router(call):
             bot.send_message(chat_id, "Ok! Riscrivi le note (se nulla “-”).", reply_markup=kb_cancel())
             return
 
-        # Before sending: enforce limits again (A1/A2)
+        # Re-check time + limits
+        if not is_request_time_allowed():
+            bot.send_message(chat_id, CLOSED_MESSAGE)
+            states.pop(user_id, None)
+            return
+
         ok, reason = can_submit_request(user_id)
         if not ok:
             bot.send_message(chat_id, reason)
             states.pop(user_id, None)
             return
 
-        # Build payload for staff
         u = call.from_user
         user_info = {
             "user_id": u.id,
@@ -602,7 +603,6 @@ def callback_router(call):
             f"Note: {req['notes']}\n"
         )
 
-        # ChatGPT formatting
         try:
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -613,12 +613,10 @@ def callback_router(call):
             )
             formatted = resp.choices[0].message.content.strip()
         except Exception:
-            formatted = "📌 NUOVA RICHIESTA VOD\n" + payload
+            formatted = "📌 NUOVA RICHIESTA\n" + payload
 
-        # Send to staff with buttons
         msg_admin = bot.send_message(ADMIN_CHAT_ID, formatted, reply_markup=kb_staff_initial())
 
-        # Register ticket info
         ticket = {
             "admin_msg_id": msg_admin.message_id,
             "user_id": user_id,
@@ -633,7 +631,6 @@ def callback_router(call):
         }
         tickets[msg_admin.message_id] = ticket
 
-        # C3 history per user
         add_history(user_id, {
             "admin_msg_id": msg_admin.message_id,
             "created_at": ticket["created_at"],
@@ -643,13 +640,11 @@ def callback_router(call):
             "status": "Nuova",
         })
 
-        # A1/A2 counters
         register_request_submission(user_id)
         inc_daily_counter()
 
-        # Confirmation to user (also show daily count)
         today_key = now_utc().strftime("%Y-%m-%d")
-        bot.send_message(chat_id, f"✅ Inviato allo staff. (Richieste oggi: {daily_counts.get(today_key,0)}) Grazie!")
+        bot.send_message(chat_id, f"✅ Inviato allo staff. (Richieste oggi: {daily_counts.get(today_key, 0)}) Grazie!")
         states.pop(user_id, None)
         return
 
@@ -662,13 +657,12 @@ def handle_text(m):
     chat_id = m.chat.id
     text = (m.text or "").strip()
 
-    # If not in flow
     if user_id not in states:
         if has_sensitive_request(text):
-            bot.send_message(chat_id, "Posso solo registrare la richiesta (titolo/dettagli) e inoltrarla allo staff. Usa /request per iniziare.")
+            bot.send_message(chat_id, "Posso solo registrare la richiesta e inoltrarla allo staff. Usa /request per iniziare.")
         return
 
-    # E1: only allowed users (also during flow)
+    # Membership check even during flow
     if not is_allowed_user(user_id):
         states.pop(user_id, None)
         bot.send_message(chat_id, "⛔ Questo bot è riservato agli utenti del gruppo.")
@@ -684,14 +678,14 @@ def handle_text(m):
 
     text = clean_text(text)
 
-    # 1) TITLE
+    # TITLE
     if step == 1:
         req["title"] = text
         st["step"] = 2
         bot.send_message(chat_id, "Perfetto. È un film o una serie?", reply_markup=kb_type())
         return
 
-    # 31) YEAR MANUAL
+    # YEAR MANUAL
     if step == 31:
         req["year"] = text
         if req["type"] == "Serie":
@@ -703,21 +697,21 @@ def handle_text(m):
             bot.send_message(chat_id, "Lingua richiesta?", reply_markup=kb_lang())
         return
 
-    # 41) SERIES SEASON/EPISODE
+    # SERIES S/E TEXT
     if step == 41:
         req["season_episode"] = text
         st["step"] = 5
         bot.send_message(chat_id, "Lingua richiesta?", reply_markup=kb_lang())
         return
 
-    # 51) LANGUAGE MANUAL
+    # LANGUAGE MANUAL
     if step == 51:
         req["language"] = text
         st["step"] = 6
         bot.send_message(chat_id, "Note extra? (se nulla scrivi “-”)", reply_markup=kb_cancel())
         return
 
-    # 6) NOTES -> CONFIRM
+    # NOTES -> CONFIRM
     if step == 6:
         req["notes"] = text
         st["step"] = 7
